@@ -1,0 +1,24 @@
+# Python-related files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+venv/
+env/
+
+# Dependency files
+*.log
+*.db
+
+# Chainlit logs
+chainlit.log
+.chainlit
+# VS Code and JetBrains IDEs
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+Thumbs.db
