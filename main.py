@@ -6,8 +6,7 @@ from langchain_community.chat_models import ChatOpenAI
 from langchain.chains import RetrievalQAWithSourcesChain
 from langchain.chains import RetrievalQA
 from passlib.hash import bcrypt
-from langchain.memory import ChatMessageHistory, ConversationBufferMemory
-
+import numpy as np
 
 USER_DB = {
     "Shreya": bcrypt.hash("ZaQ1@wSx"),  # Hash the password for security
@@ -16,85 +15,72 @@ USER_DB = {
 
 embeddings = OpenAIEmbeddings()
 embedding_model_for_pdf = OpenAIEmbeddings(model="text-embedding-3-large")
-llm=ChatOpenAI(temperature=0, model_name='gpt-4o', streaming=True)
+llm = ChatOpenAI(temperature=0, model_name='gpt-4o', streaming=True)
 
 @cl.password_auth_callback
 def auth_callback(username: str, password: str):
     """Validates username and password"""
-    
-    # Check if user exists
-    if username in USER_DB:
-        # Verify password hash
-        if bcrypt.verify(password, USER_DB[username]):  
-            return cl.User(
-                identifier=username,
-                metadata={"role": "admin" if username == "Shreya" else "user", "provider": "credentials"}
-            )
-    
+    if username in USER_DB and bcrypt.verify(password, USER_DB[username]):
+        return cl.User(
+            identifier=username,
+            metadata={"role": "admin" if username == "Shreya" else "user", "provider": "credentials"}
+        )
     return None  # Authentication failed
-
-
-@cl.set_chat_profiles
-async def chat_profile():
-    return [
-        cl.ChatProfile(
-            name="Ask questions about data in PDFs",
-            markdown_description="This chatbot can answer questions based on the PDFs on SIT website.",
-            icon="https://img.icons8.com/?size=100&id=m31DrURYH9au&format=png&color=f5145f",
-        ),
-        cl.ChatProfile(
-            name="Ask questions about data on website",
-            markdown_description="This chatbot can answer questions based on the website on SIT website.",
-            icon="https://img.icons8.com/?size=100&id=m31DrURYH9au&format=png&color=f5145f",
-        ),
-    ]
 
 @cl.on_chat_start
 async def on_chat_start():
     user = cl.user_session.get("user")
-    # if user:
-    #     await cl.Message(content=f"Welcome, {user.identifier}! You are logged in as {user.metadata['role']}").send()
-    # else:
-    #     await cl.Message(content="Authentication failed!").send()
-    chat_profile = cl.user_session.get("chat_profile")
-    await cl.Message(
-        content=f"Hi {user.identifier}, how may I help you today? \nYou can {chat_profile}."
-    ).send()
+    await cl.Message(content=f"Hi {user.identifier}, how may I help you today?").send()
+
+async def retrieve_answer(vector_db_path, embedding_model, query, llm, category):
+    """Retrieve answer and similarity score from a vector database."""
+    similarity_scores = []
+    vector_store = FAISS.load_local(vector_db_path, embedding_model, allow_dangerous_deserialization=True)
+    retriever = vector_store.as_retriever(search_kwargs={"k": 3})
+    # Retrieve documents with similarity scores
+    retrieved_docs_with_scores = vector_store.similarity_search_with_score(query, k=3)
+    for doc, score in retrieved_docs_with_scores:
+        similarity_scores.append(score)
+    if category == "pdf_data":
+        chain = RetrievalQA.from_chain_type(llm=llm, retriever=retriever)
+        response = await chain.acall(query)
+        answer = response.get("result", "No answer found.")
+    else:
+        chain = RetrievalQAWithSourcesChain.from_chain_type(llm=llm, retriever=retriever)
+        response = await chain.acall(query)
+        answer = response.get("answer", "No answer found.")
+    
+    # Get the max similarity score among the retrieved docs
+    max_similarity_score = max(similarity_scores) if similarity_scores else 0
+    return answer, max_similarity_score
 
 @cl.on_message
 async def on_message(message: cl.Message):
-    current_profile = cl.user_session.get("chat_profile")
-    cb = cl.AsyncLangchainCallbackHandler()
-    # print("current_profile: ", current_profile)
-    if current_profile and current_profile == "Ask questions about data in PDFs":
-        vector_db_path = r"C:\Shreya\Final Year Project\chainlit-chatbot\Faiss_vectorDB_PDF_data"
-        VectorStore_pdf = FAISS.load_local(vector_db_path, embedding_model_for_pdf, allow_dangerous_deserialization=True)
-        chain_pdf = RetrievalQA.from_chain_type(llm=llm, retriever=VectorStore_pdf.as_retriever())
-        # answer = chain_pdf.invoke({"query": message.content})["result"]
-        res = await chain_pdf.acall(message.content, callbacks=[cb])
-        answer = res["result"]
+    query = message.content
 
-    elif current_profile and current_profile == "Ask questions about data on website":
-        vector_db_path = r"C:\Shreya\Final Year Project\chainlit-chatbot\Faiss_vectorDB_website_data"
-        VectorStore = FAISS.load_local(vector_db_path, OpenAIEmbeddings(), allow_dangerous_deserialization=True)
-        
-        chain = RetrievalQAWithSourcesChain.from_chain_type(llm=llm, retriever=VectorStore.as_retriever())
-        # response = chain.invoke(message.content)
-        response = await chain.acall(message.content, callbacks=[cb])
-        # print(f"res keys: ", response.keys())
-        answer = response['answer']
-        
+    # Send a loading message
+    msg = cl.Message(content="🔄 Thinking...")
+    await msg.send()  # Send the initial loading message
+    
+    # Define paths for both vector databases
+    pdf_vector_db_path = r"C:\Shreya\Final Year Project\chainlit-chatbot\Faiss_vectorDB_PDF_data"
+    web_vector_db_path = r"C:\Shreya\Final Year Project\chainlit-chatbot\Faiss_vectorDB_website_data"
+    
+    # Retrieve answers and similarity scores from both databases
+    pdf_answer, pdf_score = await retrieve_answer(pdf_vector_db_path, embedding_model_for_pdf, query, llm, "pdf_data")
+    web_answer, web_score = await retrieve_answer(web_vector_db_path, embeddings, query, llm, "website_data")
+    
+    # Select the answer with the higher similarity score
+    if pdf_score > web_score:
+        final_answer = pdf_answer
+        similarity_score_str = f"\n\n\nBased on PDF data with similarity score: {pdf_score:.2f}\nWeb score: {web_score:.2f}"
+    else:
+        final_answer = web_answer
+        similarity_score_str = f"\n\n\nBased on Website data with similarity score: {web_score:.2f}\nPDF score: {pdf_score:.2f}"
 
-    else:
-        vector_db_path = None
-    
-    # print("PATH: ", vector_db_path)
-    
-    if vector_db_path:
-        # await cl.Message(content=f"Using vector DB at: {vector_db_path}").send()
-        await cl.Message(content=answer).send()
-    else:
-        await cl.Message(content="No valid profile selected.").send()
+    msg.content = f"{final_answer}"
+    await msg.update()
+
 
 
 
